@@ -1,0 +1,32 @@
+# Excel и Word оставляют файлы-замки, пока документ открыт
+~$*
+*.tmp
+
+# Секреты: токен приложения hh.ru, client_id/client_secret
+.env
+.env.*
+!.env.example
+*.secret
+secrets.*
+
+# Состояние парсера между запусками — локальное, в репозиторий не идёт
+state.json
+*.sqlite
+*.sqlite3
+*.db
+.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Редакторы и ОС
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+.DS_Store
