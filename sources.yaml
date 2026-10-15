@@ -2,20 +2,31 @@
 # Источник правды для парсера. Таблица competitor_feeds.xlsx — та же карта для чтения глазами;
 # при расхождении верен этот файл.
 #
+# Правило проекта: только белые источники. Никакого обхода авторизации и капчи,
+# никакого разбора вёрстки страниц. Методы загрузки — только машиночитаемые:
+#   hh_api         — официальный API hh.ru с токеном приложения
+#   rss            — RSS/Atom-лента
+#   sitemap        — карта сайта (urlset)
+#   sitemap_index  — индекс карт сайта, обходится по дочерним картам
+# HTML-листинги и данные «со страницы статьи» не используются.
+#
 # Статусы:
 #   ok        — адрес проверен, лента отдаёт то, что ожидалось
 #   candidate — адрес выведен из шаблона и не подтверждён, проверка описана в backlog
 #   blocked   — адрес верен, но доступ закрыт (см. blocked_by)
-#   none      — источника нет, дыра зафиксирована осознанно
+#   none      — источника нет, дыра зафиксирована осознанно (см. coverage_gaps)
 
-version: 1
-updated: 2026-10-14
+version: 2
+updated: 2026-10-15
 
 defaults:
   user_agent: "trendwatcher/1.0 (kostik80_80@mail.ru)"
   schedule: "Mon 09:00 Europe/Moscow"
   timeout_sec: 30
   retries: 2
+  # Шум по пути для всех сайтов — отбрасывается до любых правил источника (SPEC.md, раздел 3)
+  noise_paths: ["/glossary/", "/authors/", "/tags/", "/tag/", "/policy", "/privacy",
+                "/terms", "/cookie", "/personal-data", "/soglasie", "/legal", "/sitemap"]
 
 hh:
   # Анонимный доступ к api.hh.ru закрыт: 403 {"errors":[{"type":"forbidden"}]}.
@@ -31,9 +42,8 @@ hh:
 # Группы дедупликации: одна и та же статья может прийти из двух источников
 # (свой сайт + Хабр). Событие создаётся один раз на группу.
 dedup_groups:
-  kts_articles:        [kts_blog_site, kts_blog_habr]
-  simbirsoft_articles: [simbirsoft_blog_habr, simbirsoft_blog_site]
-  agima_articles:      [agima_blog_habr, agima_blog_site]
+  kts_articles:   [kts_site, kts_blog_habr]
+  agima_articles: [agima_blog_habr, agima_site]
 
 sources:
 
@@ -48,15 +58,21 @@ sources:
     blocked_by: hh_token
     id_confirmed: 2026-10-14          # на странице работодателя значится «KTS»
 
-  - id: kts_blog_site
+  - id: kts_site
     company: KTS
-    kind: articles
+    kind: site
     method: sitemap
     url: "https://kts.tech/sitemap.xml"
     status: ok
-    include_paths: ["/posts/", "/cases/"]
-    has_lastmod: false                # новые определять по появлению URL
-    note: "RSS у сайта нет"
+    # Карта забирается целиком; сигнал определяется путём, первое совпадение побеждает
+    classify:
+      - {path: "/posts/",   signal: article}
+      - {path: "/cases/",   signal: case}
+      - {path: "/awards/",  signal: noise}      # премии — шум по паспорту
+      - {path: "/articles", signal: noise}      # страница-листинг, не статья
+    default_signal: new_page                    # proptech, hrtech, finops, devops, wolfram-wfm, solutions…
+    track_lastmod_for: []                       # lastmod есть только у кейсов; у постов и страниц направлений его нет
+    measured: "2026-10-15: 149 URL — posts 105 (без lastmod), cases 15 (lastmod у 14), ~15 страниц направлений и решений (без lastmod)"
 
   - id: kts_blog_habr
     company: KTS
@@ -64,8 +80,9 @@ sources:
     method: rss
     url: "https://habr.com/ru/rss/companies/kts/articles/"
     status: ok
-    checked: 2026-10-14               # 40 записей, последняя 2026-10-07
-    note: "Часть статей выходит только здесь"
+    checked: 2026-10-14
+    measured: "2026-10-15: 4 статьи за 90 дней (раз в 3 недели); 2 из 40 — совместно с Альфа-Банком"
+    note: "Часть статей выходит только здесь. Соавторы из dc:creator — сигнал о клиенте (SPEC.md, раздел 1)"
 
   # ---------------------------------------------------------- Napoleon IT
   - id: napoleonit_vacancies
@@ -78,14 +95,29 @@ sources:
     blocked_by: hh_token
     id_confirmed: 2026-10-14
 
-  - id: napoleonit_blog
+  - id: napoleonit_site
     company: Napoleon IT
-    kind: articles
+    kind: site
     method: sitemap_index
     url: "https://napoleonit.ru/sitemap-index.xml"
     status: ok
-    include_paths: ["/blog/"]
-    note: "/sitemap.xml отдаёт 404, реальная карта указана в robots.txt. Даты — на странице /blog"
+    classify:
+      - {path: "/blog/",          signal: article}
+      - {path: "/cases/",         signal: case}
+      - {path: "/stories/",       signal: case}     # 8 URL, содержимое не проверено — см. BACKLOG
+      - {path: "/press-center",   signal: noise}
+      - {path: "/reviews",        signal: noise}
+      - {path: "/career",         signal: noise}    # вакансии берём из hh
+      - {path: "/internship",     signal: noise}
+      - {path: "/accreditation",  signal: noise}
+      - {path: "/about-us",       signal: noise}
+      - {path: "/contacts",       signal: noise}
+    default_signal: new_page                        # solutions, industries, services
+    track_lastmod_for: []                           # lastmod нет ни у одного URL
+    measured: "2026-10-15: 340 URL — blog 271, cases 27, solutions 10, industries 8, stories 8, services 6; lastmod нет"
+    note: >-
+      /sitemap.xml отдаёт 404, реальная карта указана в robots.txt. Дат публикации нет:
+      событие датируется моментом обнаружения (discovered_at)
 
   # ------------------------------------------------------- red_mad_robot
   - id: rmr_vacancies
@@ -104,11 +136,12 @@ sources:
     method: rss
     url: "https://habr.com/ru/rss/companies/redmadrobot/articles/"
     status: ok
-    checked: 2026-10-14               # 40 записей, последняя 2026-07-03
+    checked: 2026-10-14
     dormant: true
+    measured: "2026-10-15: 0 статей за 90 дней, 13 за год, последняя 2026-07-03"
     note: >-
       Единственная рабочая площадка. Блог на паузе («временно не ведёт блог»),
-      свой сайт недоступен: redmadrobot.ru не отвечает, redmadrobot.com отдаёт 500
+      свой сайт без белого источника: redmadrobot.ru не отвечает, redmadrobot.com — SPA без карты сайта
 
   # ------------------------------------------------------------- Just AI
   - id: justai_vacancies
@@ -120,18 +153,31 @@ sources:
     status: blocked
     blocked_by: hh_token
     id_confirmed: 2026-10-14
-    fallback: "https://careers.just-ai.com"
 
-  - id: justai_blog
+  - id: justai_site
     company: Just AI
-    kind: articles
-    method: sitemap
-    url: "https://just-ai.com/blog-sitemap.xml"
+    kind: site
+    method: sitemap_index
+    url: "https://just-ai.com/sitemap.xml"
     status: ok
-    include_paths: ["/blog/"]
-    has_lastmod: true
-    lastmod_is_publication_date: false   # lastmod = дата изменения; см. BACKLOG
-    note: "RSS /feed/ и /blog/feed существуют, но пустые"
+    # У Just AI тип страницы определяется не путём, а дочерней картой, из которой пришёл URL
+    classify_by_child:
+      blog-sitemap.xml:      article
+      case-sitemap.xml:      case
+      page-sitemap.xml:      new_page
+      solutions-sitemap.xml: new_page
+      category-sitemap.xml:  noise
+    default_signal: new_page                        # новая дочерняя карта = новый раздел сайта
+    # Страницы мероприятий лежат в page-sitemap рядом с продуктовыми — конференции по паспорту шум.
+    # Эвристика по slug, проверить на первых прогонах
+    exclude_slug_patterns: ["hackathon", "biznes-uzhin", "konferents", "conversations", "webinar", "meetup"]
+    track_lastmod_for: [new_page]                   # lastmod у каждого URL свой — грубый сигнал page_changed
+    measured: >-
+      2026-10-15: блог 187 URL (6 изменены за 90 дней), кейсы 26 (3 новых за 90 дней: Совкомбанк,
+      телеком, ИИ-рекрутинг), страницы 45 (12 изменены за 90 дней, в т.ч. /agent-platform-enterprise)
+    note: >-
+      Значения в CDATA. lastmod = дата правки, не публикации. RSS /feed/ и /blog/feed пустые.
+      В блоге встречаются рейтинги и отчёты о конференциях — по паспорту шум (SPEC.md, раздел 4)
 
   # -------------------------------------------------------- Siberian.pro
   - id: siberian_vacancies
@@ -143,9 +189,6 @@ sources:
     status: blocked
     blocked_by: hh_token
     id_confirmed: 2026-10-14           # ООО Сибериан.Про, найдена в каталоге hh.ru
-    note: >-
-      Страницу siberian.pro/vakansii/ как источник не использовать: 2026-10-14 на ней
-      написано «нет свободных вакансий», тогда как на hh.ru вакансия открыта
 
   - id: siberian_blog
     company: Siberian.pro
@@ -153,7 +196,17 @@ sources:
     method: rss
     url: "https://siberian.pro/feed/"
     status: ok
-    note: "WordPress. description/content пустые — берём title, link, pubDate, category; текст со страницы статьи"
+    # Еженедельные дайджесты общих новостей рынка ИИ: выходят под именем компании,
+    # но о самой компании ничего не говорят
+    exclude_title_patterns: ["дайджест", "Главные новости AI"]
+    exclude_url_patterns: ["/blog/glavnye-novosti-ai-dajdzhest"]
+    measured: >-
+      2026-10-15: 10 записей за 5 недель (лента держит 10), все в /blog/; 6 из 10 в категории
+      «Новости», четыре верхние — дайджесты
+    note: >-
+      WordPress. Берём title, link, pubDate, category. Текст статьи не забираем —
+      description/content в ленте пустые, а разбор страницы вне правил проекта.
+      Категорию «Новости» целиком не исключаем: не все записи в ней — дайджесты
 
   # ---------------------------------------------------------- SimbirSoft
   - id: simbirsoft_vacancies
@@ -165,7 +218,6 @@ sources:
     status: blocked
     blocked_by: hh_token
     id_confirmed: 2026-10-14           # «СимбирСофт»
-    fallback: "https://www.simbirsoft.com/vacancies/"
 
   - id: simbirsoft_blog_habr
     company: SimbirSoft
@@ -173,16 +225,9 @@ sources:
     method: rss
     url: "https://habr.com/ru/rss/companies/simbirsoft/articles/"
     status: ok
-    checked: 2026-10-14               # 40 записей, последняя 2026-10-01
-
-  - id: simbirsoft_blog_site
-    company: SimbirSoft
-    kind: articles
-    method: html_list
-    url: "https://www.simbirsoft.com/blog/tag/"
-    status: ok
-    enabled: false                     # запасной: включать, если Хабр перестанет покрывать темы
-    note: "Sitemap сайта даёт 404 даже в браузере, RSS /blog/rss/ — 404"
+    checked: 2026-10-14
+    measured: "2026-10-15: 5 статей за 90 дней (раз в 2,5 недели); совместных публикаций нет"
+    note: "Единственный белый источник статей: sitemap сайта отдаёт 404, RSS сайта — 404"
 
   # ---------------------------------------------------- Softline digital
   - id: softline_vacancies
@@ -194,21 +239,11 @@ sources:
     status: blocked
     blocked_by: hh_token
     id_confirmed: false
+    scope: group                       # лента всей группы Softline, не подразделения
     note: >-
-      2381 — вся группа «Softline», не digital-подразделение. Отдельного работодателя
-      Softline digital на hh.ru нет (проверено 2026-10-14). Вакансии подразделения,
-      если они есть, придётся отбирать из общего потока по тексту
-
-  - id: softline_blog
-    company: Softline digital
-    kind: articles
-    method: html_list
-    url: "https://softline.ru/about/blog"
-    status: ok
-    checked: 2026-10-14
-    note: >-
-      Параметр ?NEWS_COUNT игнорируется, голая страница и так отдаёт 40 карточек с датами.
-      Блог общегрупповой — нужен фильтр по теме. Sitemap не обновляется (lastmod 2026-03-27)
+      2381 — вся группа «Softline». Отдельного работодателя Softline digital на hh.ru нет.
+      Вакансии подразделения, если они есть, придётся отбирать из общего потока по тексту.
+      Белого источника статей у Softline digital нет — см. coverage_gaps
 
   # --------------------------------------------------------------- AGIMA
   - id: agima_vacancies
@@ -220,7 +255,7 @@ sources:
     status: blocked
     blocked_by: hh_token
     id_confirmed: 2026-10-14
-    fallback: "https://www.agima.ru/careers/vacancy/"
+    fallback: "Появление новых URL в /careers/ из sitemap agima.ru (16 страниц вакансий на 2026-10-15)"
 
   - id: agima_blog_habr
     company: AGIMA
@@ -228,18 +263,29 @@ sources:
     method: rss
     url: "https://habr.com/ru/rss/companies/agima/articles/"
     status: ok
-    checked: 2026-10-14               # 40 записей, последняя 2026-10-14
-    note: "Самый активный источник в карте"
+    checked: 2026-10-14
+    measured: "2026-10-15: 10 статей за 90 дней (почти раз в неделю); 2 из 40 совместные — Ozon Банк, Онтико"
+    note: "Самый активный сигнальный источник в карте"
 
-  - id: agima_blog_site
+  - id: agima_site
     company: AGIMA
-    kind: articles
+    kind: site
     method: sitemap
     url: "https://www.agima.ru/sitemap.xml"
     status: ok
-    include_paths: ["/blog/"]
-    exclude_paths: ["/blog/glossary/", "/authors/"]
-    has_lastmod: true
+    classify:
+      - {path: "/blog/",     signal: article}
+      - {path: "/projects/", signal: case}
+      - {path: "/events/",   signal: noise}       # конференции — шум по паспорту
+      - {path: "/careers/",  signal: noise}       # вакансии берём из hh; это запасной источник
+      - {path: "/about",     signal: noise}
+      - {path: "/clients",   signal: noise}
+      - {path: "/contacts",  signal: noise}
+    default_signal: new_page                      # approach, special-projects
+    track_lastmod_for: [new_page]                 # lastmod у каждого URL свой
+    measured: >-
+      2026-10-15: 1107 URL — glossary 531, blog 259 (11 изменены за 90 дней), projects 137,
+      authors 97, events 43, approach 16, careers 16, special-projects 4
 
   # -------------------------------------------------------------- R77 AI
   - id: r77_vacancies
@@ -249,7 +295,7 @@ sources:
     status: none
     note: >-
       На hh.ru не найдена (2026-10-14): по «R77»/«R77 AI» — 0 компаний, «Р77» — другая
-      компания из Чебоксар. Своей страницы вакансий у сайта нет. Дыра принята
+      компания из Чебоксар. Своей страницы вакансий у сайта нет. Дыра принята — см. coverage_gaps
 
   - id: r77_cases
     company: R77 AI
@@ -259,7 +305,12 @@ sources:
     status: ok
     dormant: true
     include_paths: ["/cases/tpost/"]
-    note: "Tilda. Компания почти не публикует — держим как спящий источник"
+    measured: >-
+      2026-10-15: 28 кейсов (2024 — 10, 2025 — 16, 2026 — 2). Обе записи 2026 года
+      опубликованы одним днём, 15.06: компания выкладывает кейсы пачками
+    note: >-
+      Tilda: элементы ленты размечены как <item turbo="true">, парсер должен это принимать.
+      У каждого кейса есть <category> — отрасль клиента, это готовое поле для сигнала case
 
   # ----------------------------------------------------------- Nord Clan
   - id: nordclan_vacancies
@@ -277,9 +328,60 @@ sources:
     kind: articles
     method: rss
     url: "https://nordclan.com/rss-feed-111193114321.xml"
-    status: candidate
+    status: ok
+    checked: 2026-10-15
     include_paths: ["/blog/"]
-    fallback: "https://nordclan.com/sitemap-feed-111193114321.xml"
+    measured: "2026-10-15: 50 записей, все в /blog/, последняя 2026-10-14; 24 за 90 дней — почти 2 в неделю"
     note: >-
-      id ленты — факт (sitemap-feed проверен, ≈49 статей, последняя 2026-10-12),
-      адрес RSS собран по шаблону Tilda и не открывался. Единственный живой источник компании
+      Tilda, элементы <item turbo="true">. Самый громкий источник в карте, и много в нём
+      SEO-обзоров рынка («ТОП-8 российских RAG-систем») — о чужих продуктах, а не о Nord Clan.
+      Отраслевые темы (ЕГИСЗ, ЕСИА, ERP/MES) при этом честно показывают, кому они продают.
+      Громкость гасится лимитом на компанию в сводке (SPEC.md, раздел 5)
+
+# ---------------------------------------------------------------------------
+# Дыры в покрытии: по кому и чему белых источников нет.
+# Записаны явно, чтобы пустота в сводке не выглядела поломкой.
+
+coverage_gaps:
+
+  - company: Softline digital
+    verdict: "Белых источников именно по компании нет"
+    detail: >-
+      Вакансии — только группа целиком (hh 2381). Статьи: блог softline.ru/about/blog
+      общегрупповой (1 из 12 свежих статей про ИИ) и доступен только через вёрстку;
+      карта сайта устарела (в ней 3 из 12 свежих статей, lastmod массовые);
+      блог на Хабре мёртв с 25.02.2022. Всё, что есть, — про группу Softline, а не про digital
+
+  - company: R77 AI
+    verdict: "Белых источников практически нет"
+    detail: >-
+      Вакансий нет ни на hh.ru, ни на сайте; блога на Хабре не найдено.
+      Остаётся одна лента кейсов: 2 записи за год, обе одним днём
+
+  - company: red_mad_robot
+    verdict: "Живой канал появится только с токеном hh"
+    detail: >-
+      Хабр на паузе с 2026-07-03, у своего сайта нет карты (SPA), redmadrobot.ru не отвечает.
+      До одобрения заявки на dev.hh.ru по компании не приходит ничего
+
+  - company: "все"
+    channel: Telegram
+    verdict: "Белого источника нет"
+    detail: >-
+      Паспорт оставляет публикации в Telegram в сводке, но у публичных каналов нет
+      машиночитаемой ленты: веб-версия — это HTML, бот не читает чужие каналы,
+      клиентский API требует входа под пользовательским аккаунтом
+
+  - company: "все"
+    channel: vc.ru
+    verdict: "Не проверено"
+    detail: "Есть ли у vc.ru машиночитаемая лента по компании — пункт в BACKLOG.md"
+
+  - company: "все"
+    signal: page_changed
+    verdict: "Только грубо и только у двух компаний"
+    detail: >-
+      Изменение lastmod у известного URL — сигнал без разбора страницы. Работает у Just AI
+      и AGIMA. У Napoleon IT lastmod нет ни у одного URL, у KTS — только у кейсов, не у страниц
+      направлений. Отличить правку цены от правки
+      баннера без разбора вёрстки нельзя — это ограничение, а не недоделка
