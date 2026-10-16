@@ -6,7 +6,9 @@
 """
 
 import email.utils
+import http.client
 import json
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -22,6 +24,14 @@ TIMEOUT_SEC = 30
 TRACKING_PARAMS = {"hhtmfrom", "from", "yclid", "gclid", "fbclid"}
 
 ATOM = "{http://www.w3.org/2005/Atom}"
+
+# То же условие, что у events.url в базе, плюс непустой хост. Строку, которая его
+# не проходит, база отклонит вместе со всей пачкой источника — отсеиваем заранее.
+VALID_URL = re.compile(r"^https://[^/\s]+\S*$")
+
+# Сбои сети, HTTP, разбора XML и ответов Supabase. Ломают один источник, а не весь прогон.
+SOURCE_ERRORS = (urllib.error.URLError, OSError, http.client.HTTPException,
+                 ET.ParseError, ValueError, RuntimeError)
 
 
 # ---------------------------------------------------------------- настройки
@@ -95,11 +105,12 @@ def fetch(url: str) -> bytes:
 
 def normalize_url(url: str) -> str:
     """Канонический вид ссылки: https, хост в нижнем регистре, без меток кампаний,
-    без якоря и без завершающего слеша."""
+    без якоря и без завершающего слеша. Пробелы и кириллица в пути кодируются
+    (%20, %D0%BF…), уже закодированное не трогается."""
     parts = urllib.parse.urlsplit(url.strip())
     query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
              if not k.lower().startswith("utm_") and k.lower() not in TRACKING_PARAMS]
-    path = parts.path.rstrip("/")
+    path = urllib.parse.quote(parts.path.rstrip("/"), safe="/%:@!$&'()*+,;=~")
     return urllib.parse.urlunsplit(
         ("https", parts.netloc.lower(), path, urllib.parse.urlencode(query), "")
     ).rstrip("/")
@@ -142,9 +153,11 @@ def parse_feed(xml: bytes) -> list[dict]:
             "summary": text(item, "description"),
         })
     for item in root.iter(ATOM + "entry"):               # Atom
-        link = item.find(ATOM + "link[@rel='alternate']")
-        if link is None:
-            link = item.find(ATOM + "link")
+        # Ссылка на материал — rel="alternate"; без rel она alternate по стандарту.
+        # rel="self", "edit" и прочие ведут на служебные адреса ленты.
+        links = item.findall(ATOM + "link")
+        link = next((l for l in links if l.get("rel", "alternate") == "alternate"),
+                    links[0] if links else None)
         entries.append({
             "title": text(item, ATOM + "title"),
             "link": link.get("href") if link is not None else None,
@@ -160,16 +173,23 @@ def title_from_url(url: str) -> str:
     return urllib.parse.unquote(segment).replace("-", " ") or url
 
 
-def to_events(entries: list[dict], source: dict, discovered_at: str) -> list[dict]:
-    """Записи ленты → строки таблицы events. Дубликаты ссылок внутри ленты схлопываются.
+def to_events(entries: list[dict], source: dict, discovered_at: str) -> tuple[list[dict], int]:
+    """Записи ленты → строки таблицы events и число пропущенных ссылок.
+    Дубликаты ссылок внутри ленты схлопываются. Относительная ссылка достраивается
+    от адреса ленты; ссылка, которую база не примет (не http, без хоста), пропускается —
+    иначе из-за неё отклонилась бы вся пачка источника.
     Описание (summary) не пишем: поля для него в схеме нет."""
     signal = (source.get("settings") or {}).get("default_signal", "article")
     is_baseline = source.get("baseline_done_at") is None
     rows = {}
+    skipped = 0
     for entry in entries:
         if not entry["link"]:
             continue
-        url = normalize_url(entry["link"])
+        url = normalize_url(urllib.parse.urljoin(source["url"], entry["link"].strip()))
+        if not VALID_URL.match(url) or url.endswith("/"):
+            skipped += 1
+            continue
         if url in rows:
             continue
         rows[url] = {
@@ -183,10 +203,21 @@ def to_events(entries: list[dict], source: dict, discovered_at: str) -> list[dic
             "discovered_at": discovered_at,
             "is_baseline": is_baseline,
         }
-    return list(rows.values())
+    return list(rows.values()), skipped
 
 
 # ---------------------------------------------------------------- прогон
+
+def save_state(db: Supabase, source: dict, fields: dict) -> bool:
+    """Пишет поля состояния источника. Сбой не прерывает прогон: остальные источники
+    всё равно опрашиваются, а состояние запишется в следующий раз."""
+    try:
+        db.update_source(source["id"], fields)
+        return True
+    except SOURCE_ERRORS as e:
+        print(f"{source['url']}  состояние не сохранено: {e}")
+        return False
+
 
 def run() -> int:
     env = load_env(Path(__file__).with_name(".env"))
@@ -198,7 +229,7 @@ def run() -> int:
     db = Supabase(url, key)
     try:
         sources = db.active_rss_sources()
-    except (urllib.error.URLError, OSError, RuntimeError) as e:
+    except SOURCE_ERRORS as e:
         print(f"Не удалось прочитать sources из Supabase: {e}")
         return 2
 
@@ -207,28 +238,31 @@ def run() -> int:
         now = datetime.now(timezone.utc).isoformat()
         try:
             entries = parse_feed(fetch(source["url"]))
-            written = db.insert_new_events(to_events(entries, source, now))
-        except (urllib.error.URLError, OSError, ET.ParseError, ValueError, RuntimeError) as e:
+            rows, skipped = to_events(entries, source, now)
+            written = db.insert_new_events(rows)
+        except SOURCE_ERRORS as e:
             errors += 1
+            print(f"{source['url']}  ошибка: {e}")
             # Ошибка не трогает события источника (SPEC.md, раздел 2, правило 2)
-            db.update_source(source["id"], {
+            save_state(db, source, {
                 "last_checked_at": now,
                 "consecutive_errors": source["consecutive_errors"] + 1,
                 "last_error": str(e)[:300],
             })
-            print(f"{source['url']}  ошибка: {e}")
             continue
 
         state = {"last_checked_at": now, "last_success_at": now,
                  "consecutive_errors": 0, "last_error": None}
         if source.get("baseline_done_at") is None:
             state["baseline_done_at"] = now
-        db.update_source(source["id"], state)
+        if not save_state(db, source, state):
+            errors += 1
 
         total_found += len(entries)
         total_written += written
+        note = f", пропущено ссылок {skipped}" if skipped else ""
         mark = "  (немой прогон)" if source.get("baseline_done_at") is None else ""
-        print(f"{source['url']}  найдено {len(entries)}, записано {written}{mark}")
+        print(f"{source['url']}  найдено {len(entries)}, записано {written}{note}{mark}")
 
     print(f"Итого: источников {len(sources)}, ошибок {errors}, "
           f"найдено {total_found}, записано {total_written}")

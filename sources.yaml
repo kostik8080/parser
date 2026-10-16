@@ -1,6 +1,9 @@
 # Реестр источников трендвотчера конкурентов.
-# Источник правды для парсера. Таблица competitor_feeds.xlsx — та же карта для чтения глазами;
-# при расхождении верен этот файл.
+# Начальное наполнение и описание замеров. Источник правды для сборщика — таблица sources
+# в Supabase (docs/db-schema.md): адрес, способ загрузки и правила (settings) сборщик берёт
+# оттуда, этот файл он не читает. Проверенные строки переносятся в базу SQL-файлами db/00N_….sql.
+# Таблица competitor_feeds.xlsx — та же карта для чтения глазами; при расхождении с ней
+# верен этот файл.
 #
 # Правило проекта: только белые источники. Никакого обхода авторизации и капчи,
 # никакого разбора вёрстки страниц. Методы загрузки — только машиночитаемые:
@@ -17,7 +20,7 @@
 #   none      — источника нет, дыра зафиксирована осознанно (см. coverage_gaps)
 
 version: 2
-updated: 2026-10-15
+updated: 2026-10-16
 
 defaults:
   user_agent: "trendwatcher/1.0 (kostik80_80@mail.ru)"
@@ -71,7 +74,6 @@ sources:
       - {path: "/awards/",  signal: noise}      # премии — шум по паспорту
       - {path: "/articles", signal: noise}      # страница-листинг, не статья
     default_signal: new_page                    # proptech, hrtech, finops, devops, wolfram-wfm, solutions…
-    track_lastmod_for: []                       # lastmod есть только у кейсов; у постов и страниц направлений его нет
     measured: "2026-10-15: 149 URL — posts 105 (без lastmod), cases 15 (lastmod у 14), ~15 страниц направлений и решений (без lastmod)"
 
   - id: kts_blog_habr
@@ -113,7 +115,6 @@ sources:
       - {path: "/about-us",       signal: noise}
       - {path: "/contacts",       signal: noise}
     default_signal: new_page                        # solutions, industries, services
-    track_lastmod_for: []                           # lastmod нет ни у одного URL
     measured: "2026-10-15: 340 URL — blog 271, cases 27, solutions 10, industries 8, stories 8, services 6; lastmod нет"
     note: >-
       /sitemap.xml отдаёт 404, реальная карта указана в robots.txt. Дат публикации нет:
@@ -171,7 +172,6 @@ sources:
     # Страницы мероприятий лежат в page-sitemap рядом с продуктовыми — конференции по паспорту шум.
     # Эвристика по slug, проверить на первых прогонах
     exclude_slug_patterns: ["hackathon", "biznes-uzhin", "konferents", "conversations", "webinar", "meetup"]
-    track_lastmod_for: [new_page]                   # lastmod у каждого URL свой — грубый сигнал page_changed
     measured: >-
       2026-10-15: блог 187 URL (6 изменены за 90 дней), кейсы 26 (3 новых за 90 дней: Совкомбанк,
       телеком, ИИ-рекрутинг), страницы 45 (12 изменены за 90 дней, в т.ч. /agent-platform-enterprise)
@@ -282,7 +282,6 @@ sources:
       - {path: "/clients",   signal: noise}
       - {path: "/contacts",  signal: noise}
     default_signal: new_page                      # approach, special-projects
-    track_lastmod_for: [new_page]                 # lastmod у каждого URL свой
     measured: >-
       2026-10-15: 1107 URL — glossary 531, blog 259 (11 изменены за 90 дней), projects 137,
       authors 97, events 43, approach 16, careers 16, special-projects 4
@@ -378,10 +377,10 @@ coverage_gaps:
     detail: "Есть ли у vc.ru машиночитаемая лента по компании — пункт в BACKLOG.md"
 
   - company: "все"
-    signal: page_changed
-    verdict: "Только грубо и только у двух компаний"
+    signal: "изменение цен, тарифов, формулировок"
+    verdict: "Не отслеживается (решение 16.10.2026)"
     detail: >-
-      Изменение lastmod у известного URL — сигнал без разбора страницы. Работает у Just AI
-      и AGIMA. У Napoleon IT lastmod нет ни у одного URL, у KTS — только у кейсов, не у страниц
-      направлений. Отличить правку цены от правки
-      баннера без разбора вёрстки нельзя — это ограничение, а не недоделка
+      Единственный белый признак — изменение lastmod у известного URL, и он есть только
+      у Just AI и AGIMA (у Napoleon IT lastmod нет ни у одного URL, у KTS — только у кейсов).
+      Отличить правку цены от правки баннера без разбора вёрстки нельзя. Поэтому lastmod
+      не храним и сигнала page_changed нет — docs/db-schema.md, «Принятые решения», пункт 1
