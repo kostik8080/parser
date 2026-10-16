@@ -38,7 +38,7 @@ create table sources (
 );
 
 comment on table  sources                    is 'Источники: адреса и их состояние. Описание — docs/db-schema.md';
-comment on column sources.settings           is 'Настройки способа загрузки: employer_id, classify, default_signal, track_lastmod_for';
+comment on column sources.settings           is 'Настройки способа загрузки: employer_id, classify, default_signal';
 comment on column sources.enabled            is 'Выключенный источник сборщик пропускает';
 comment on column sources.last_checked_at    is 'Последнее обращение, с любым исходом';
 comment on column sources.last_success_at    is 'Последний успешный ответ';
@@ -68,7 +68,7 @@ comment on column digests.sent_at      is 'Пусто — собрана, но �
 -- ============================================================ events
 -- Одна строка — один материал, включая шум. Ключ — каноническая ссылка:
 -- повторный прогон с той же ссылкой вторую строку не создаст.
--- Изменившаяся страница (page_changed) обновляет свою строку, а не добавляет новую.
+-- Обновления страниц не отслеживаются: lastmod не храним, page_changed нет.
 
 create table events (
     url            text        primary key
@@ -76,7 +76,7 @@ create table events (
     source_id      text        not null references sources (id),
     signal         text        not null
                                check (signal in ('vacancy_ai', 'vacancy_other', 'article',
-                                                 'case', 'new_page', 'page_changed')),
+                                                 'case', 'new_page')),
     verdict        text        not null
                                check (verdict in ('event', 'keep', 'noise')),
     reason         text,
@@ -92,7 +92,6 @@ create table events (
     experience     text,
     industry       text,
     co_companies   text[],
-    lastmod        timestamptz,
 
     digest_id      bigint      references digests (id) on delete set null,
     useful         boolean
