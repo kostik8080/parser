@@ -1,0 +1,64 @@
+# Служебные адреса из карт сайтов: в события не попадают, сборщик их отсекает сразу.
+# Общий список для всех карт сайтов (SPEC.md, раздел 3, «Общий шум по пути»).
+#
+# Один шаблон в строке, после # — комментарий. Шаблон ищется подстрокой в пути
+# и параметрах адреса, без учёта регистра; кириллица — как есть, не %D0%….
+# К пути добавляется завершающий /, поэтому:
+#   /feed/   ловит /blog/feed и /blog/feed/, но не /feedback
+#   /policy  ловит /policy и /policy-2024, но не /blog/new-policy-review;
+#            нужен ровно сегмент — добавьте / и на конце: /policy/
+# Параметры идут после ?, например ?page=2: шаблон ?page= ловит первый параметр,
+# &page= — любой следующий.
+
+# --- политика, оферта, согласия, юридические страницы
+# С / в начале: слово должно открывать сегмент пути. Без него под шаблон попадают
+# статьи вроде /blog/…-zaklyuchili-soglashenie-… или /blog/…-zashhity-personalnyh-dannyh-…
+/policy
+/privacy
+/politika
+/konfiden
+/terms
+/cookie
+/oferta
+/offer/
+/personal-data
+/personalnye-dannye
+/personalnyh-dannyh
+/soglasie
+/soglashenie
+/legal
+
+# --- поиск
+/search/
+/poisk/
+?s=
+?q=
+&q=
+?search=
+&search=
+
+# --- теги и рубрики-теги
+/tag/
+/tags/
+
+# --- авторы
+/author/
+/authors/
+
+# --- постраничная навигация
+/page/
+?page=
+&page=
+?paged=
+&paged=
+pagen_
+
+# --- ленты
+/feed/
+/rss/
+/atom/
+rss-feed
+
+# --- прочий шум из SPEC.md: глоссарии и сами карты сайтов
+/glossary/
+/sitemap

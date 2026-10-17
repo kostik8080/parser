@@ -1,11 +1,12 @@
-"""Сборщик трендвотчера: RSS-ленты из таблицы sources → таблица events в Supabase.
+"""Сборщик трендвотчера: RSS-ленты и карты сайтов из таблицы sources → таблица events в Supabase.
 
 Запуск:  python collector.py
-Настройки — в .env (шаблон: .env.example). Схема базы — docs/db-schema.md.
-Только стандартная библиотека Python, внешних зависимостей нет.
+Настройки — в .env (шаблон: .env.example), исключения для карт сайтов — в sitemap_exclude.txt.
+Схема базы — docs/db-schema.md. Только стандартная библиотека Python, внешних зависимостей нет.
 """
 
 import email.utils
+import gzip
 import http.client
 import json
 import re
@@ -50,6 +51,19 @@ def load_env(path: Path) -> dict:
     return env
 
 
+def load_exclusions(path: Path) -> list[str]:
+    """Читает шаблоны служебных адресов: по одному в строке, после # — комментарий.
+    Решётка в шаблоне не нужна: якорь из ссылки и так убирается."""
+    if not path.exists():
+        return []
+    patterns = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip().lower()
+        if line:
+            patterns.append(line)
+    return patterns
+
+
 # ---------------------------------------------------------------- Supabase
 
 class Supabase:
@@ -77,8 +91,10 @@ class Supabase:
             raise RuntimeError(f"Supabase {e.code}: {e.read().decode('utf-8', 'replace')[:300]}") from e
         return json.loads(raw) if raw else None
 
-    def active_rss_sources(self) -> list:
-        return self.request("GET", "sources?enabled=eq.true&method=eq.rss&select=*&order=id")
+    def active_sources(self) -> list:
+        """Включённые источники тех способов загрузки, которые сборщик умеет разбирать."""
+        methods = ",".join(READERS)
+        return self.request("GET", f"sources?enabled=eq.true&method=in.({methods})&select=*&order=id")
 
     def insert_new_events(self, rows: list) -> int:
         """Вставляет события; ссылки, которые уже есть в базе, пропускает. Возвращает число новых."""
@@ -167,10 +183,73 @@ def parse_feed(xml: bytes) -> list[dict]:
     return entries
 
 
+def parse_sitemap(xml: bytes) -> tuple[list[dict], list[str]]:
+    """Карта сайта → (записи, адреса вложенных карт). У urlset берём адрес страницы
+    и дату изменения (lastmod), у sitemapindex — адреса вложенных карт.
+    Пространство имён не проверяем: встречаются карты и с другим, и без него."""
+    root = ET.fromstring(xml)
+    kind = local_name(root.tag)
+    if kind not in ("urlset", "sitemapindex"):
+        raise ValueError(f"не карта сайта: корневой элемент <{kind}>")
+    entries, children = [], []
+    for item in root:
+        loc = child_text(item, "loc")
+        if local_name(item.tag) == "url":
+            entries.append({"title": None, "link": loc,
+                            "published": child_text(item, "lastmod"), "summary": None})
+        elif local_name(item.tag) == "sitemap" and loc:
+            children.append(loc)
+    return entries, children
+
+
+def local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def child_text(el, name: str) -> str | None:
+    """Текст дочернего элемента по имени без пространства имён. CDATA парсер раскрывает сам."""
+    for child in el:
+        if local_name(child.tag) == name and child.text and child.text.strip():
+            return child.text.strip()
+    return None
+
+
+def fetch_sitemap(url: str) -> tuple[list[dict], list[str]]:
+    data = fetch(url)
+    if data[:2] == b"\x1f\x8b":                         # sitemap.xml.gz
+        data = gzip.decompress(data)
+    return parse_sitemap(data)
+
+
+def is_excluded(url: str, patterns: list[str]) -> bool:
+    """Служебный ли адрес. Шаблон ищется подстрокой в пути и параметрах в нижнем
+    регистре; к пути добавлен завершающий /, чтобы шаблон /feed/ поймал и …/feed,
+    но не …/feedback."""
+    parts = urllib.parse.urlsplit(normalize_url(url))
+    target = urllib.parse.unquote(parts.path).lower().rstrip("/") + "/"
+    if parts.query:
+        target += "?" + urllib.parse.unquote(parts.query).lower()
+    return any(p in target for p in patterns)
+
+
+# Сегмент-идентификатор, а не слова: число, хэш, код записи Tilda
+ID_SEGMENT = re.compile(r"^(\d+|(?=[0-9a-f]*\d)[0-9a-f]{8,}|index|amp)$")
+# Префикс-идентификатор перед словами: «ti2ta5n1r1-upravlenie» у записей Tilda
+ID_PREFIX = re.compile(r"^(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{8,}-(?=.)")
+PAGE_EXTENSION = re.compile(r"\.(html?|php|aspx?)$")
+
+
 def title_from_url(url: str) -> str:
-    """Запасной заголовок: последний сегмент пути, дефисы → пробелы (SPEC.md, раздел 1)."""
-    segment = urllib.parse.urlsplit(url).path.rstrip("/").rsplit("/", 1)[-1]
-    return urllib.parse.unquote(segment).replace("-", " ") or url
+    """Запасной заголовок: последний осмысленный сегмент пути, дефисы и подчёркивания →
+    пробелы (SPEC.md, раздел 1). Числа, хэши и index пропускаются, расширение .html
+    и префикс-идентификатор Tilda отрезаются."""
+    for segment in reversed(urllib.parse.urlsplit(url).path.split("/")):
+        segment = PAGE_EXTENSION.sub("", urllib.parse.unquote(segment))
+        if not segment or ID_SEGMENT.match(segment.lower()):
+            continue
+        segment = ID_PREFIX.sub("", segment)
+        return segment.replace("-", " ").replace("_", " ").strip() or url
+    return url
 
 
 def to_events(entries: list[dict], source: dict, discovered_at: str) -> tuple[list[dict], int]:
@@ -206,6 +285,31 @@ def to_events(entries: list[dict], source: dict, discovered_at: str) -> tuple[li
     return list(rows.values()), skipped
 
 
+# ---------------------------------------------------------------- способы загрузки
+# Каждый получает строку sources и список исключений, возвращает записи
+# (title, link, published, summary) и число отсечённых служебных адресов.
+# Дальше всё общее: to_events, upsert, состояние источника, вывод.
+
+def read_rss(source: dict, exclusions: list[str]) -> tuple[list[dict], int]:
+    return parse_feed(fetch(source["url"])), 0
+
+
+def read_sitemap(source: dict, exclusions: list[str]) -> tuple[list[dict], int]:
+    """Карта сайта целиком. Вложенные карты открываются на один уровень, глубже — нет.
+    Сбой любой вложенной карты — сбой всего источника: иначе её адреса не попали бы
+    в немой прогон и в следующий раз пришли бы разом как новые события.
+    Событие — появление нового адреса; lastmod на новизну не влияет."""
+    entries, children = fetch_sitemap(source["url"])
+    for child in children:
+        child_entries, _ = fetch_sitemap(urllib.parse.urljoin(source["url"], child))
+        entries.extend(child_entries)
+    kept = [e for e in entries if e["link"] and not is_excluded(e["link"], exclusions)]
+    return kept, sum(1 for e in entries if e["link"]) - len(kept)
+
+
+READERS = {"rss": read_rss, "sitemap": read_sitemap, "sitemap_index": read_sitemap}
+
+
 # ---------------------------------------------------------------- прогон
 
 def save_state(db: Supabase, source: dict, fields: dict) -> bool:
@@ -228,16 +332,20 @@ def run() -> int:
 
     db = Supabase(url, key)
     try:
-        sources = db.active_rss_sources()
+        sources = db.active_sources()
     except SOURCE_ERRORS as e:
         print(f"Не удалось прочитать sources из Supabase: {e}")
         return 2
+    exclusions = load_exclusions(Path(__file__).with_name("sitemap_exclude.txt"))
 
     total_found = total_written = errors = 0
     for source in sources:
         now = datetime.now(timezone.utc).isoformat()
         try:
-            entries = parse_feed(fetch(source["url"]))
+            read = READERS.get(source.get("method"))
+            if read is None:
+                raise ValueError(f"способ загрузки {source.get('method')!r} не поддерживается")
+            entries, excluded = read(source, exclusions)
             rows, skipped = to_events(entries, source, now)
             written = db.insert_new_events(rows)
         except SOURCE_ERRORS as e:
@@ -260,7 +368,8 @@ def run() -> int:
 
         total_found += len(entries)
         total_written += written
-        note = f", пропущено ссылок {skipped}" if skipped else ""
+        note = f", отсечено служебных {excluded}" if excluded else ""
+        note += f", пропущено ссылок {skipped}" if skipped else ""
         mark = "  (немой прогон)" if source.get("baseline_done_at") is None else ""
         print(f"{source['url']}  найдено {len(entries)}, записано {written}{note}{mark}")
 

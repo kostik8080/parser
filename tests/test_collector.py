@@ -4,6 +4,7 @@
 """
 
 import contextlib
+import gzip
 import http.client
 import io
 import re
@@ -26,7 +27,7 @@ def db_accepts(url: str) -> bool:
 
 
 def source(**fields) -> dict:
-    row = {"id": "test_src", "url": "https://example.ru/feed/", "settings": {},
+    row = {"id": "test_src", "method": "rss", "url": "https://example.ru/feed/", "settings": {},
            "baseline_done_at": None, "consecutive_errors": 0}
     row.update(fields)
     return row
@@ -79,6 +80,17 @@ class TitleFromUrlTest(unittest.TestCase):
 
     def test_no_path_falls_back_to_url(self):
         self.assertEqual(collector.title_from_url("https://a.ru"), "https://a.ru")
+
+    def test_ids_and_index_skipped(self):
+        for url, title in [("https://a.ru/blog/kak-my-schitali-rag/2", "kak my schitali rag"),
+                           ("https://a.ru/cases/telecom/index.html", "telecom"),
+                           ("https://a.ru/news/5f3a9c1e7b2d", "news"),
+                           ("https://a.ru/solutions/agent_platform.php", "agent platform")]:
+            self.assertEqual(collector.title_from_url(url), title, url)
+
+    def test_tilda_id_prefix_removed(self):
+        self.assertEqual(collector.title_from_url("https://nordclan.com/blog/ti2ta5n1r1-upravlenie"),
+                         "upravlenie")
 
 
 # ---------------------------------------------------------------- даты
@@ -166,6 +178,128 @@ class ParseFeedTest(unittest.TestCase):
     def test_not_xml_raises(self):
         with self.assertRaises(collector.ET.ParseError):
             collector.parse_feed(b"<html><body>captcha")
+
+
+# ---------------------------------------------------------------- карты сайтов
+
+URLSET = b"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://a.ru/cases/telecom/</loc><lastmod>2026-10-07T10:00:00+03:00</lastmod>
+       <changefreq>weekly</changefreq></url>
+  <url><loc><![CDATA[https://a.ru/solutions/agent-platform]]></loc></url>
+  <url><lastmod>2026-10-01</lastmod></url>
+</urlset>"""
+
+INDEX = b"""<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>https://a.ru/page-sitemap.xml</loc><lastmod>2026-10-16</lastmod></sitemap>
+  <sitemap><loc>/case-sitemap.xml.gz</loc></sitemap>
+</sitemapindex>"""
+
+
+class ParseSitemapTest(unittest.TestCase):
+
+    def test_urlset(self):
+        entries, children = collector.parse_sitemap(URLSET)
+        self.assertEqual(children, [])
+        self.assertEqual(entries, [
+            {"title": None, "link": "https://a.ru/cases/telecom/",
+             "published": "2026-10-07T10:00:00+03:00", "summary": None},
+            {"title": None, "link": "https://a.ru/solutions/agent-platform",
+             "published": None, "summary": None},
+            {"title": None, "link": None, "published": "2026-10-01", "summary": None},
+        ])
+
+    def test_index(self):
+        entries, children = collector.parse_sitemap(INDEX)
+        self.assertEqual(entries, [])
+        self.assertEqual(children, ["https://a.ru/page-sitemap.xml", "/case-sitemap.xml.gz"])
+
+    def test_without_namespace(self):
+        entries, _ = collector.parse_sitemap(b"<urlset><url><loc>https://a.ru/x</loc></url></urlset>")
+        self.assertEqual(entries[0]["link"], "https://a.ru/x")
+
+    def test_not_sitemap_raises(self):
+        with self.assertRaises(ValueError):
+            collector.parse_sitemap(RSS)
+
+
+SHIPPED_EXCLUSIONS = collector.load_exclusions(
+    Path(collector.__file__).with_name("sitemap_exclude.txt"))
+
+
+class ExclusionsTest(unittest.TestCase):
+
+    def test_service_pages_excluded(self):
+        for url in ["https://a.ru/privacy-policy/", "https://a.ru/politika-konfidentsialnosti",
+                    "https://a.ru/oferta", "https://a.ru/legal/offer/", "https://a.ru/search/?q=ai",
+                    "https://a.ru/?s=rag", "https://a.ru/blog/tag/ml/", "https://a.ru/tags/llm",
+                    "https://a.ru/author/ivan/", "https://a.ru/blog/page/2/",
+                    "https://a.ru/blog?page=3", "https://a.ru/blog?sort=new&page=3",
+                    "https://a.ru/news/?PAGEN_1=2", "https://a.ru/blog/feed/", "https://a.ru/feed",
+                    "https://a.ru/glossary/rag", "https://a.ru/sitemap.html",
+                    "https://a.ru/soglasie-na-obrabotku"]:
+            self.assertTrue(collector.is_excluded(url, SHIPPED_EXCLUSIONS), url)
+
+    def test_content_pages_kept(self):
+        for url in ["https://a.ru/feedback", "https://a.ru/blog/landing-page-ai",
+                    "https://a.ru/cases/telecom", "https://a.ru/blog/searchable-rag",
+                    "https://a.ru/blog?id=5", "https://a.ru/solutions/offer-management",
+                    "https://a.ru/authorship-ai", "https://a.ru/",
+                    "https://a.ru/blog/bristol-i-napoleon-it-zaklyuchili-soglashenie-o-vnedrenii",
+                    "https://a.ru/blog/zashhity-personalnyh-dannyh-pri-rabote-s-ii"]:
+            self.assertFalse(collector.is_excluded(url, SHIPPED_EXCLUSIONS), url)
+
+    def test_cyrillic_pattern_matches_encoded_path(self):
+        self.assertTrue(collector.is_excluded("https://a.ru/%D0%BF%D0%BE%D0%B8%D1%81%D0%BA",
+                                              ["/поиск/"]))
+
+    def test_load_exclusions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "x.txt"
+            path.write_text("# заголовок\n\n/Tag/\n?page=   # постраничная\n", encoding="utf-8")
+            self.assertEqual(collector.load_exclusions(path), ["/tag/", "?page="])
+        self.assertEqual(collector.load_exclusions(Path("нет_такого_файла.txt")), [])
+
+
+class ReadSitemapTest(unittest.TestCase):
+
+    def read(self, pages: dict, exclusions=()):
+        fetched = []
+
+        def fetch(url):
+            fetched.append(url)
+            return pages[url]
+        with mock.patch.object(collector, "fetch", side_effect=fetch):
+            entries, excluded = collector.read_sitemap(
+                source(method="sitemap_index", url="https://a.ru/sitemap.xml"), list(exclusions))
+        return entries, excluded, fetched
+
+    def test_nested_maps_one_level_deep(self):
+        deeper = b"""<sitemapindex><sitemap><loc>https://a.ru/too-deep.xml</loc></sitemap>
+                     </sitemapindex>"""
+        entries, _, fetched = self.read({
+            "https://a.ru/sitemap.xml": INDEX.replace(b"</sitemapindex>",
+                b"<sitemap><loc>https://a.ru/nested-index.xml</loc></sitemap></sitemapindex>"),
+            "https://a.ru/page-sitemap.xml": URLSET,
+            "https://a.ru/case-sitemap.xml.gz": gzip.compress(
+                b"<urlset><url><loc>https://a.ru/cases/bank</loc></url></urlset>"),
+            "https://a.ru/nested-index.xml": deeper,
+        })
+        self.assertEqual(fetched, ["https://a.ru/sitemap.xml", "https://a.ru/page-sitemap.xml",
+                                   "https://a.ru/case-sitemap.xml.gz", "https://a.ru/nested-index.xml"])
+        self.assertEqual([e["link"] for e in entries], ["https://a.ru/cases/telecom/",
+                                                        "https://a.ru/solutions/agent-platform",
+                                                        "https://a.ru/cases/bank"])
+
+    def test_exclusions_counted(self):
+        entries, excluded, _ = self.read({"https://a.ru/sitemap.xml": URLSET}, ["/cases/"])
+        self.assertEqual([e["link"] for e in entries], ["https://a.ru/solutions/agent-platform"])
+        self.assertEqual(excluded, 1)
+
+    def test_failed_child_fails_source(self):
+        with self.assertRaises(KeyError):
+            self.read({"https://a.ru/sitemap.xml": INDEX, "https://a.ru/page-sitemap.xml": URLSET})
 
 
 # ---------------------------------------------------------------- строки events
@@ -256,7 +390,7 @@ class FakeDB:
         self.fail_insert, self.fail_update = fail_insert, fail_update
         self.inserted, self.updates = [], []
 
-    def active_rss_sources(self):
+    def active_sources(self):
         return self.sources
 
     def insert_new_events(self, rows):
@@ -351,9 +485,29 @@ class RunTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("ошибок 2", out)
 
+    def test_sitemap_source(self):
+        db = FakeDB([source(id="site", method="sitemap", url="https://a.ru/sitemap.xml",
+                            settings={"default_signal": "new_page"})])
+        sitemap = URLSET.replace(b"</urlset>",
+                                 b"<url><loc>https://a.ru/privacy-policy</loc></url></urlset>")
+        code, out = self.run_collector(db, lambda url: sitemap)
+        self.assertEqual(code, 0)
+        self.assertEqual([(r["url"], r["title"], r["signal"], r["published_at"]) for r in db.inserted], [
+            ("https://a.ru/cases/telecom", "telecom", "new_page", "2026-10-07T10:00:00+03:00"),
+            ("https://a.ru/solutions/agent-platform", "agent platform", "new_page", None),
+        ])
+        self.assertIn("найдено 2, записано 2, отсечено служебных 1", out)
+
+    def test_unknown_method_is_source_error(self):
+        db = FakeDB([source(id="a", method="hh_api"), source(id="b", url="https://x.ru/2")])
+        code, out = self.run_collector(db, lambda url: FEED)
+        self.assertEqual(code, 1)
+        self.assertEqual([r["source_id"] for r in db.inserted], ["b"])
+        self.assertIn("не поддерживается", db.updates[0][1]["last_error"])
+
     def test_cannot_read_sources(self):
         db = FakeDB([])
-        db.active_rss_sources = mock.Mock(side_effect=RuntimeError("Supabase 401: bad key"))
+        db.active_sources = mock.Mock(side_effect=RuntimeError("Supabase 401: bad key"))
         code, out = self.run_collector(db, lambda url: FEED)
         self.assertEqual(code, 2)
         self.assertIn("Не удалось прочитать sources", out)
