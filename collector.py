@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 USER_AGENT = "trendwatcher/1.0"
-TIMEOUT_SEC = 30
+TIMEOUT_SEC = 15
 
 # Метки рекламных кампаний и переходов — в ссылке события не нужны (SPEC.md, раздел 1)
 TRACKING_PARAMS = {"hhtmfrom", "from", "yclid", "gclid", "fbclid"}
